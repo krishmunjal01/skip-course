@@ -71,6 +71,7 @@ class CourseRunner:
         self.user_id: Optional[str] = None
         self.course_id: Optional[str] = None
         self.failed_items: set[str] = set()
+        self.skipped_items: set[str] = set()
 
         # Dispatch table: item type -> handler. Built once auth is confirmed.
         self._handlers: dict[str, Callable[[dict], bool]] = {
@@ -190,10 +191,10 @@ class CourseRunner:
 
             actionable = [
                 item for item in pending
-                if not item.get("isLocked", False) and item["id"] not in self.failed_items
+                if not item.get("isLocked", False) and item["id"] not in self.failed_items and item["id"] not in self.skipped_items
             ]
             if not actionable:
-                click.echo(f"\nStopped — {total - len(pending)}/{total} completed, {len(pending)} locked or failed.")
+                click.echo(f"\nStopped — {total - len(pending)}/{total} completed, {len(pending)} pending (locked, failed, or skipped).")
                 return
 
             concurrent_batch = [i for i in actionable if i["contentSummary"]["typeName"] not in SEQUENTIAL_TYPES]
@@ -215,30 +216,32 @@ class CourseRunner:
     def _run_single_item(self, item: dict) -> None:
         start = time.monotonic()
         try:
-            success = self._dispatch_item(item)
+            status = self._dispatch_item(item)
             elapsed = time.monotonic() - start
-            if success:
-                _print_item_status(item["name"], "done", elapsed)
-            else:
-                _print_item_status(item["name"], "failed", elapsed)
+            _print_item_status(item["name"], status, elapsed)
+            if status == "failed":
                 self.failed_items.add(item["id"])
+            elif status == "skip":
+                self.skipped_items.add(item["id"])
         except Exception:
             elapsed = time.monotonic() - start
             _print_item_status(item["name"], "failed", elapsed)
             logger.exception(f"Error processing item {item['id']}")
             self.failed_items.add(item["id"])
 
-    def _timed_dispatch(self, item: dict) -> tuple[bool, float]:
+    def _timed_dispatch(self, item: dict) -> tuple[str, float]:
         start = time.monotonic()
-        success = self._dispatch_item(item)
-        return success, time.monotonic() - start
+        status = self._dispatch_item(item)
+        return status, time.monotonic() - start
 
     def _collect_result(self, item: dict, future) -> None:
         try:
-            success, elapsed = future.result()
-            _print_item_status(item["name"], "done" if success else "failed", elapsed)
-            if not success:
+            status, elapsed = future.result()
+            _print_item_status(item["name"], status, elapsed)
+            if status == "failed":
                 self.failed_items.add(item["id"])
+            elif status == "skip":
+                self.skipped_items.add(item["id"])
         except Exception:
             _print_item_status(item["name"], "failed", 0.0)
             logger.exception(f"Error processing item {item['id']}")
@@ -246,19 +249,18 @@ class CourseRunner:
 
     # Item dispatch
 
-    def _dispatch_item(self, item: dict) -> bool:
+    def _dispatch_item(self, item: dict) -> str:
         item_type = item["contentSummary"]["typeName"]
 
         if item_type in MANUAL_SKIP_TYPES:
-            _print_item_status(item["name"], "skip", 0.0)
-            return True
+            return "skip"
 
         handler = self._handlers.get(item_type)
         if handler is None:
-            _print_item_status(item["name"], "skip", 0.0)
-            return True
+            return "skip"
 
-        return handler(item)
+        success = handler(item)
+        return "done" if success else "failed"
 
     def _handle_lecture(self, item: dict) -> bool:
         metadata = self._fetch_video_metadata(item["id"])
